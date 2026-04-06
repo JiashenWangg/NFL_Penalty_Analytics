@@ -10,6 +10,7 @@ Do individual referees exhibit consistent differences in penalty rates after con
 
 ## Data Sources
 Play-by-play data from the nflverse (nflfastR), including penalties and game context
+
 Game-level referee assignments from nflreadr::load_officials()
 
 ## Motivation
