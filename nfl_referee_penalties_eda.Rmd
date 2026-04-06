@@ -1,0 +1,526 @@
+---
+title: 'NFL Referee Penalties: Data Loading and EDA'
+author: "Jiashen Wang"
+date: "`r Sys.Date()`"
+output: pdf_document
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 4,
+  dpi = 140
+)
+```
+
+- use `nflreadr::load_pbp()` for penalty events and game context,
+- use `nflreadr::load_officials()` for game-level official assignments,
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(nflreadr)
+library(janitor)
+library(skimr)
+library(gt)
+library(scales)
+library(lubridate)
+library(glue)
+library(forcats)
+library(patchwork)
+library(broom)
+```
+
+```{r parameters}
+seasons <- 2015:2025
+season_type_keep <- c("REG")
+```
+
+
+# 1) Load datasets
+
+```{r load-pbp}
+pbp_raw <- load_pbp(seasons) %>%
+  clean_names()
+
+pbp_raw %>% dim()
+```
+
+```{r load-officials}
+officials_raw <- load_officials(seasons) %>%
+  clean_names()
+
+officials_raw %>% dim()
+```
+
+```{r officials-glimpse}
+head(officials_raw)
+```
+
+# 2) EDA: Play-by-play data
+
+```{r pbp-clean}
+pbp <- pbp_raw %>%
+  filter(season %in% seasons) %>%
+  filter(if ("season_type" %in% names(.)) season_type %in% season_type_keep else TRUE) %>%
+  filter(!is.na(game_id))
+
+pbp %>% summarise(rows = n(), games = n_distinct(game_id), seasons = n_distinct(season))
+```
+
+```{r pbp-head}
+pbp %>%
+  select(c("game_id", "season", "week", "home_team", "away_team", "posteam", "defteam",
+                "qtr", "down", "play_type", "desc", "penalty", "penalty_yards")) %>%
+  slice_head(n = 5)
+```
+
+## Identify penalty plays
+
+```{r penalty-definition}
+penalty_plays <- pbp %>%
+  filter(if ("penalty" %in% names(.)) penalty == 1 else FALSE)
+
+penalty_plays %>%
+  summarise(
+    penalty_rows = n(),
+    penalty_games = n_distinct(game_id),
+    pct_of_all_rows = n() / nrow(pbp)
+  )
+```
+
+### Penalty rate by season
+
+```{r penalty-by-season-table}
+penalty_by_season <- pbp %>%
+  group_by(season) %>%
+  summarise(
+    plays = n(),
+    penalties = sum(penalty == 1, na.rm = TRUE),
+    penalty_rate = penalties / plays,
+    avg_penalty_yards = mean(penalty_yards[penalty == 1], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+penalty_by_season %>%
+  mutate(
+    penalty_rate = percent(penalty_rate, accuracy = 0.01),
+    avg_penalty_yards = round(avg_penalty_yards, 2)
+  ) %>%
+  gt()
+```
+
+```{r penalty-by-season-plot}
+ggplot(penalty_by_season, aes(x = season, y = penalty_rate)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  ylim(0.05, 0.08) +
+  labs(
+    title = "Penalty play rate by season",
+    x = "Season",
+    y = "Penalty plays / all play-by-play rows"
+  ) +
+  theme_minimal()
+```
+
+### Distribution of penalty yards
+
+```{r penalty-yards-hist}
+penalty_plays %>%
+  filter(!is.na(penalty_yards), penalty_yards >= 0) %>%
+  ggplot(aes(x = penalty_yards)) +
+  geom_histogram(binwidth = 5) +
+  labs(
+    title = "Distribution of penalty yards on flagged plays",
+    x = "Penalty yards",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+### Which situations produce more penalties?
+
+```{r penalty-situation-summary}
+penalty_context <- pbp %>%
+  mutate(
+    is_penalty = penalty == 1,
+    qtr = factor(qtr),
+    down = factor(down),
+    play_type = fct_lump_n(as.factor(play_type), n = 8)
+  )
+
+context_summary <- penalty_context %>%
+  group_by(qtr, down, play_type) %>%
+  summarise(
+    plays = n(),
+    penalties = sum(is_penalty, na.rm = TRUE),
+    penalty_rate = penalties / plays,
+    .groups = "drop"
+  ) %>%
+  filter(plays >= 100)
+
+context_summary %>%
+  arrange(desc(penalty_rate)) %>%
+  slice_head(n = 10) %>%
+  gt()
+```
+
+```{r penalty-by-quarter}
+pbp %>%
+  mutate(qtr = factor(qtr)) %>%
+  group_by(qtr) %>%
+  summarise(
+    plays = n(),
+    penalties = sum(penalty == 1, na.rm = TRUE),
+    rate = penalties / plays,
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = qtr, y = rate)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Penalty rate by quarter",
+    x = "Quarter",
+    y = "Penalty rate"
+  ) +
+  theme_minimal()
+```
+
+```{r penalty-by-down}
+pbp %>%
+  filter(!is.na(down)) %>%
+  mutate(down = factor(down)) %>%
+  group_by(down) %>%
+  summarise(
+    plays = n(),
+    penalties = sum(penalty == 1, na.rm = TRUE),
+    rate = penalties / plays,
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = down, y = rate)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Penalty rate by down",
+    x = "Down",
+    y = "Penalty rate"
+  ) +
+  theme_minimal()
+```
+
+### Most common penalty teams and penalty types
+
+```{r penalty-team-type-tables}
+penalty_plays %>%
+  count(penalty_team, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  gt()
+```
+
+```{r desc-sample-penalties}
+penalty_plays %>%
+  select(c("game_id", "season", "week", "posteam", "defteam", "play_type", "desc", "penalty_yards")) %>%
+  slice_head(n = 5)
+```
+
+## Game-level aggregation from play-by-play
+
+```{r game-level-pbp}
+game_level <- pbp %>%
+  group_by(game_id, old_game_id, season, week, season_type, home_team, away_team) %>%
+  summarise(
+    total_rows = n(),
+    total_penalties = sum(penalty == 1, na.rm = TRUE),
+    total_penalty_yards = sum(penalty_yards, na.rm = TRUE),
+    unique_posteams = n_distinct(posteam, na.rm = TRUE),
+    mean_abs_score_diff = mean(abs(score_differential), na.rm = TRUE),
+    mean_ydstogo = mean(ydstogo, na.rm = TRUE),
+    pass_rate = mean(play_type == "pass", na.rm = TRUE),
+    rush_rate = mean(play_type == "run", na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r game-penalty-distribution}
+ggplot(game_level, aes(x = total_penalties)) +
+  geom_histogram(binwidth = 1) +
+  labs(
+    title = "Distribution of total penalties per game",
+    x = "Total penalties in game",
+    y = "Number of games"
+  ) +
+  theme_minimal()
+```
+
+```{r game-overdispersion-check}
+game_level %>%
+  summarise(
+    mean_penalties = mean(total_penalties, na.rm = TRUE),
+    var_penalties = var(total_penalties, na.rm = TRUE),
+    overdispersion_ratio = var_penalties / mean_penalties
+  ) %>%
+  gt()
+```
+
+## Team-game aggregation from play-by-play
+
+```{r team-game-level}
+team_game_level <- pbp %>%
+  filter(!is.na(posteam)) %>%
+  group_by(game_id, old_game_id, season, week, season_type, home_team, away_team, posteam) %>%
+  summarise(
+    team_plays = n(),
+    team_penalties = sum(penalty == 1 & penalty_team == first(posteam), na.rm = TRUE),
+    team_penalty_yards = sum(if_else(penalty_team == first(posteam), penalty_yards, 0), na.rm = TRUE),
+    offensive_penalty_rows = sum(penalty == 1 & posteam == penalty_team, na.rm = TRUE),
+    mean_ydstogo = mean(ydstogo, na.rm = TRUE),
+    mean_abs_score_diff = mean(abs(score_differential), na.rm = TRUE),
+    early_down_rate = mean(down %in% c(1, 2), na.rm = TRUE),
+    pass_rate = mean(play_type == "pass", na.rm = TRUE),
+    rush_rate = mean(play_type == "run", na.rm = TRUE),
+    is_home = as.integer(first(posteam) == first(home_team)),
+    .groups = "drop"
+  )
+```
+
+```{r home-away-penalties}
+team_game_level %>%
+  mutate(home_away = if_else(is_home == 1, "Home", "Away")) %>%
+  group_by(home_away) %>%
+  summarise(
+    mean_penalties = mean(team_penalties, na.rm = TRUE),
+    median_penalties = median(team_penalties, na.rm = TRUE),
+    mean_penalty_yards = mean(team_penalty_yards, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  gt()
+```
+
+```{r home-away-boxplot}
+team_game_level %>%
+  mutate(home_away = if_else(is_home == 1, "Home", "Away")) %>%
+  ggplot(aes(x = home_away, y = team_penalties)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of team penalties by home/away status",
+    x = NULL,
+    y = "Team penalties in game"
+  ) +
+  theme_minimal()
+```
+
+
+# 3) EDA: Officials data
+
+```{r officials-basic-summary}
+officials <- officials_raw %>%
+  filter(season %in% seasons) %>%
+  filter(if ("season_type" %in% names(.)) season_type %in% season_type_keep else TRUE)
+
+officials %>%
+  summarise(
+    rows = n(),
+    games = n_distinct(game_id),
+    officials = n_distinct(official_name),
+    positions = n_distinct(position)
+  )
+```
+
+```{r officials-head}
+officials %>%
+  slice_head(n = 5)
+```
+
+## Extract lead referee summaries
+
+```{r referee-game-level}
+referee_game <- officials %>%
+  filter(position == "Referee") %>%
+  transmute(
+    game_id,
+    season,
+    week,
+    lead_referee = official_name,
+    lead_referee_id = official_id,
+    referee_jersey = jersey_number
+  )
+
+referee_game %>%
+  summarise(games = n(), unique_referees = n_distinct(lead_referee))
+```
+
+```{r top-referees-by-games}
+referee_game %>%
+  count(lead_referee, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  gt()
+```
+
+
+# 4) Joined EDA: penalties merged with officiating data
+
+```{r}
+referee_game <- officials %>%
+  filter(position == "Referee") %>%
+  transmute(
+    old_game_id = game_id,
+    season,
+    week,
+    lead_referee = official_name,
+    lead_ref_id = official_id
+  )
+```
+
+```{r joined-game-level}
+game_joined <- game_level %>%
+  left_join(referee_game, by = c("old_game_id", "season", "week"))
+
+game_joined %>%
+  summarise(
+    games = n(),
+    missing_referee = sum(is.na(lead_referee)),
+    pct_missing_referee = mean(is.na(lead_referee))
+  )
+```
+
+```{r joined-game-head}
+game_joined %>%
+  select(c("game_id", "season", "week", "home_team", "away_team",
+                "total_penalties", "total_penalty_yards", "total_rows",
+                "lead_referee")) %>%
+  slice_head(n = 5)
+```
+
+## Team-game joined dataset
+
+```{r joined-team-game}
+team_game_joined <- team_game_level %>%
+  left_join(referee_game, by = c("old_game_id", "season", "week"))
+
+table(
+  has_referee = !is.na(team_game_joined$lead_referee),
+  useNA = "ifany"
+)
+```
+
+## Raw referee differences: do some refs call more penalties?
+
+### Referee-level game averages
+
+```{r ref-summary-game}
+ref_game_summary <- game_joined %>%
+  filter(!is.na(lead_referee)) %>%
+  group_by(lead_referee) %>%
+  summarise(
+    games = n(),
+    mean_penalties = mean(total_penalties, na.rm = TRUE),
+    median_penalties = median(total_penalties, na.rm = TRUE),
+    sd_penalties = sd(total_penalties, na.rm = TRUE),
+    mean_penalty_yards = mean(total_penalty_yards, na.rm = TRUE),
+    mean_total_rows = mean(total_rows, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(games >= 8) %>%
+  arrange(desc(mean_penalties))
+
+ref_game_summary %>%
+  slice_head(n = 20) %>%
+  gt()
+```
+
+```{r ref-avg-penalties-plot}
+ref_game_summary %>%
+  slice_max(order_by = mean_penalties, n = 20) %>%
+  mutate(lead_referee = fct_reorder(lead_referee, mean_penalties)) %>%
+  ggplot(aes(x = lead_referee, y = mean_penalties)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Highest raw average penalties per game by lead referee",
+    x = NULL,
+    y = "Mean penalties per game"
+  ) +
+  theme_minimal()
+```
+
+### Relationship between game pace and penalties, colored by referee
+
+```{r plays-vs-penalties, fig.width=8, fig.height=6}
+set.seed(123)
+plot_data <- game_joined %>%
+  filter(!is.na(lead_referee)) %>%
+  mutate(lead_referee = fct_lump_n(lead_referee, n = 10))
+
+ggplot(plot_data, aes(x = total_rows, y = total_penalties, color = lead_referee)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Games with more plays tend to have more penalties",
+    x = "Total play-by-play rows in game",
+    y = "Total penalties"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Home / away penalty differences under different referees
+
+```{r referee-home-away}
+ref_home_away <- team_game_joined %>%
+  filter(!is.na(lead_referee)) %>%
+  mutate(home_away = if_else(is_home == 1, "Home", "Away")) %>%
+  group_by(lead_referee, home_away) %>%
+  summarise(
+    games = n(),
+    mean_team_penalties = mean(team_penalties, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(games >= 8)
+
+ref_home_away %>%
+  slice_head(n = 10) %>%
+  gt()
+```
+
+## Team and referee interaction patterns
+
+```{r team-ref-heatmap-data}
+team_ref_summary <- team_game_joined %>%
+  filter(!is.na(lead_referee)) %>%
+  group_by(lead_referee, posteam) %>%
+  summarise(
+    games = n(),
+    mean_penalties = mean(team_penalties, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(games >= 3)
+
+team_ref_summary %>%
+  arrange(desc(games)) %>%
+  slice_head(n = 10) %>%
+  gt()
+```
+
+```{r ref-team-heatmap}
+heatmap_data <- team_ref_summary %>%
+  group_by(lead_referee) %>%
+  summarise(total_games = sum(games), .groups = "drop") %>%
+  slice_max(order_by = total_games, n = 12) %>%
+  select(lead_referee) %>%
+  inner_join(team_ref_summary, by = "lead_referee")
+
+ggplot(heatmap_data, aes(x = posteam, y = fct_reorder(lead_referee, games, .fun = sum), fill = mean_penalties)) +
+  geom_tile() +
+  labs(
+    title = "Mean team penalties by team and lead referee",
+    x = "Team",
+    y = "Lead referee",
+    fill = "Mean penalties"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
