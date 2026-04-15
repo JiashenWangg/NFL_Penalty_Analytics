@@ -1,0 +1,350 @@
+---
+title: "NFL Referee Penalties"
+author: "Jiashen Wang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r}
+#| warning: false
+#| message: false
+library(tidyverse)
+library(nflreadr)
+library(janitor)
+library(lme4)
+library(glmmTMB)
+library(brms)
+library(broom.mixed)
+```
+
+# Load and Process data
+
+```{r}
+seasons = 2015:2025
+season_type_keep = c("REG")
+pbp_raw = load_pbp(seasons)
+officials_raw = load_officials(seasons)
+```
+
+```{r}
+pbp = pbp_raw %>%
+  filter(season %in% seasons) %>%
+  filter(if ("season_type" %in% names(.)) season_type %in% season_type_keep else TRUE) %>%
+  filter(!is.na(game_id))
+
+officials = officials_raw %>%
+  filter(season %in% seasons) %>%
+  filter(if ("season_type" %in% names(.)) season_type %in% season_type_keep else TRUE)
+```
+
+```{r}
+pbp %>%
+  summarise(
+    rows = n(),
+    games = n_distinct(game_id),
+    seasons = n_distinct(season)
+  )
+
+officials %>%
+  summarise(
+    rows = n(),
+    games = n_distinct(game_id),
+    officials = n_distinct(official_name),
+    positions = n_distinct(position)
+  )
+```
+
+```{r}
+# number of distinct lead referees
+officials %>%
+  filter(position == "Referee") %>%
+  summarise(
+    lead_refs = n_distinct(official_name)
+  )
+```
+
+```{r}
+referee_game = officials %>%
+  filter(position == "Referee") %>%
+  transmute(old_game_id = game_id, season, week, lead_referee = official_name, lead_ref_id = official_id)
+```
+
+```{r}
+# Data frame with one row per team-game, summarizing penalties and context
+team_game_level = pbp %>%
+  filter(!is.na(posteam)) %>%
+  group_by(game_id, old_game_id, season, week, season_type,
+           home_team, away_team, posteam, defteam) %>%
+  summarise(
+    team_plays = n(),
+    team_penalties = sum(penalty == 1 & penalty_team == first(posteam), na.rm = TRUE),
+    team_penalty_yards = sum(if_else(penalty_team == first(posteam), penalty_yards, 0), na.rm = TRUE),
+    offensive_penalty_rows = sum(penalty == 1 & posteam == penalty_team, na.rm = TRUE),
+    mean_ydstogo = mean(ydstogo, na.rm = TRUE),
+    mean_abs_score_diff = mean(abs(score_differential), na.rm = TRUE),
+    early_down_rate = mean(down %in% c(1, 2), na.rm = TRUE),
+    pass_rate = mean(play_type == "pass", na.rm = TRUE),
+    rush_rate = mean(play_type == "run", na.rm = TRUE),
+    is_home = as.integer(first(posteam) == first(home_team)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+team_game_joined = team_game_level %>%
+  left_join(referee_game, by = c("old_game_id", "season", "week"))
+```
+
+```{r}
+team_game_joined %>%
+  summarise(
+    rows = n(),
+    missing_referee = sum(is.na(lead_referee)),
+    pct_missing_referee = mean(is.na(lead_referee))
+  )
+```
+
+```{r}
+team_game_model_data = team_game_joined %>%
+  filter(!is.na(lead_referee))
+```
+
+
+# EDA
+
+## Distribution of team penalties
+
+```{r}
+team_game_model_data %>%
+  ggplot(aes(x = team_penalties)) +
+  geom_histogram(binwidth = 1) +
+  labs(
+    title = "Distribution of team penalties per game",
+    x = "Team penalties",
+    y = "Number of team-games"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+team_game_model_data %>%
+  summarise(
+    mean_penalties = mean(team_penalties, na.rm = TRUE),
+    var_penalties = var(team_penalties, na.rm = TRUE))
+```
+
+## Raw averages by referee
+
+```{r}
+ref_raw_summary = team_game_model_data %>%
+  group_by(lead_referee) %>%
+  summarise(
+    games = n(),
+    mean_team_penalties = mean(team_penalties, na.rm = TRUE),
+    mean_team_penalty_yards = mean(team_penalty_yards, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(games >= 8) %>%
+  arrange(desc(mean_team_penalties))
+
+ref_raw_summary %>%
+  slice_head(n = 15)
+```
+
+```{r}
+ref_raw_summary %>%
+  slice_max(order_by = mean_team_penalties, n = 10) %>%
+  mutate(lead_referee = fct_reorder(lead_referee, mean_team_penalties)) %>%
+  ggplot(aes(x = lead_referee, y = mean_team_penalties)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Highest raw average team penalties by lead referee",
+    x = NULL,
+    y = "Mean team penalties"
+  ) +
+  theme_minimal()
+```
+
+
+# Crossed random effects models
+
+```{r}
+nb_crossed_mod = glmmTMB(
+  team_penalties ~ offset(log(team_plays)) +
+    is_home + mean_abs_score_diff + pass_rate + early_down_rate +
+    (1 | lead_referee) + (1 | posteam) + (1 | defteam),
+  family = nbinom2,
+  data = team_game_model_data
+)
+summary(nb_crossed_mod)
+```
+
+```{r}
+ref_effects = ranef(nb_crossed_mod)$cond$lead_referee %>%
+  as.data.frame() %>%
+  rownames_to_column("lead_referee") %>%
+  rename(ref_effect = `(Intercept)`)
+
+ref_effects %>%
+  arrange(desc(ref_effect)) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+ref_effects %>%
+  mutate(lead_referee = fct_reorder(lead_referee, ref_effect)) %>%
+  ggplot(aes(x = lead_referee, y = ref_effect)) +
+  geom_point() +
+  coord_flip() +
+  labs(
+    title = "Lead referee random effects",
+    x = NULL,
+    y = "Estimated referee effect"
+  ) +
+  theme_minimal()
+```
+
+## Offensive team effects
+
+```{r}
+posteam_effects = ranef(nb_crossed_mod)$cond$posteam %>%
+  as.data.frame() %>%
+  rownames_to_column("posteam") %>%
+  rename(posteam_effect = `(Intercept)`)
+
+posteam_effects %>%
+  arrange(desc(posteam_effect)) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+posteam_effects %>%
+  mutate(posteam = fct_reorder(posteam, posteam_effect)) %>%
+  ggplot(aes(x = posteam, y = posteam_effect)) +
+  geom_point() +
+  coord_flip() +
+  labs(
+    title = "Offensive team random effects",
+    x = NULL,
+    y = "Estimated offensive team effect"
+  ) +
+  theme_minimal()
+```
+
+## Defensive opponent effects
+
+```{r}
+defteam_effects = ranef(nb_crossed_mod)$cond$defteam %>%
+  as.data.frame() %>%
+  rownames_to_column("defteam") %>%
+  rename(defteam_effect = `(Intercept)`)
+
+defteam_effects %>%
+  arrange(desc(defteam_effect)) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+defteam_effects %>%
+  mutate(defteam = fct_reorder(defteam, defteam_effect)) %>%
+  ggplot(aes(x = defteam, y = defteam_effect)) +
+  geom_point() +
+  coord_flip() +
+  labs(
+    title = "Defensive opponent random effects",
+    x = NULL,
+    y = "Estimated defensive opponent effect"
+  ) +
+  theme_minimal()
+```
+
+
+# Bayesian crossed random effects model
+
+```{r}
+bayes_crossed_mod = brm(
+  team_penalties ~ offset(log(team_plays)) +
+    is_home + mean_abs_score_diff + pass_rate + early_down_rate +
+    (1 | lead_referee) + (1 | posteam) + (1 | defteam),
+  family = negbinomial(),
+  data = team_game_model_data,
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(0, 2), class = "Intercept"),
+    prior(student_t(3, 0, 2.5), class = "sd"),
+    prior(student_t(3, 0, 2.5), class = "shape")
+  ),
+  chains = 4,
+  iter = 2000,
+  cores = 10,
+  seed = 123
+)
+```
+
+```{r}
+summary(bayes_crossed_mod)
+```
+
+## Posterior referee effects
+
+```{r}
+bayes_ref_effects = ranef(bayes_crossed_mod)$lead_referee[, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("lead_referee")
+
+bayes_ref_effects %>%
+  arrange(desc(Estimate)) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+bayes_ref_effects %>%
+  mutate(lead_referee = fct_reorder(lead_referee, Estimate)) %>%
+  ggplot(aes(x = lead_referee, y = Estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Posterior referee effects with 95% intervals",
+    x = NULL,
+    y = "Posterior referee effect"
+  ) +
+  theme_minimal()
+```
+
+# Observations
+
+```{r}
+bayes_ref_effects %>%
+  arrange(desc(Estimate)) %>%
+  select(lead_referee, Estimate, Q2.5, Q97.5) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+bayes_posteam_effects = ranef(bayes_crossed_mod)$posteam[, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("posteam")
+
+bayes_posteam_effects %>%
+  arrange(desc(Estimate)) %>%
+  select(posteam, Estimate, Q2.5, Q97.5) %>%
+  slice_head(n = 10)
+```
+
+```{r}
+bayes_defteam_effects = ranef(bayes_crossed_mod)$defteam[, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("defteam")
+
+bayes_defteam_effects %>%
+  arrange(desc(Estimate)) %>%
+  select(defteam, Estimate, Q2.5, Q97.5) %>%
+  slice_head(n = 10)
+```
+

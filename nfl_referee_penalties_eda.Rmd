@@ -467,6 +467,20 @@ ggplot(plot_data, aes(x = total_rows, y = total_penalties, color = lead_referee)
   theme(legend.position = "bottom")
 ```
 
+
+```{r}
+ggplot(game_joined, aes(x = total_rows, y = total_penalties)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Relationship between total plays and penalties in NFL games",
+    x = "Number of plays in a game",
+    y = "Number of penalties"
+  ) +
+  theme_minimal()
+```
+
+
 ### Home / away penalty differences under different referees
 
 ```{r referee-home-away}
